@@ -17,7 +17,7 @@ const crcTable = (() => {
     }
 
     return table;
-})(); 
+})();
 
 export function updateCRC(chunk, crc) {
     for (const byte of chunk) {
@@ -26,21 +26,4 @@ export function updateCRC(chunk, crc) {
     }
 
     return crc;
-}
-
-export async function crcFile(fd) {
-    const readStream = fd.createReadStream({start: 0, autoClose: false});
-    let crc = 0xffffffff;
-
-    return new Promise((resolve, reject) => {
-        readStream.on("data", d => {
-            crc = updateCRC(d, crc);
-        });
-
-        readStream.on("end", () => {
-            resolve((crc ^ 0xffffffff) >>> 0);
-        });
-
-        readStream.on("error", reject);
-    });
 }
