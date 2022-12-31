@@ -17,31 +17,33 @@
       [zip64 end of central directory locator]
       [end of central directory record]
 */
-import fsp from "fs/promises"
 import fs from "fs";
 import { Transform } from "stream";
-import { pipeline } from "stream/promises";
+import { finished } from "stream/promises";
 import { createDeflateRaw } from "zlib";
 import { Signatures, CompressionMethods, Flags } from "./constants.mjs";
 import { updateCRC } from "./crc.mjs";
 
-export function getFileName(filePath) {
-    const regex = RegExp("([^\/]*?)$");
-    const normalisedPath = filePath.replaceAll("\\", "/");
-    const result = regex.exec(normalisedPath);
+export function getFileNameFromPath(filePath) {
+    let fileName = "";
 
-    if (result[1]) {
-        return result[1];
-    }
+    for (const char of filePath) {
+        if (char === "/" || char === "\\") {
+            fileName = "";
+        }
+        else {
+            fileName += char;
+        }
+    };
 
-    return null;
+    return fileName;
 }
 
-async function getFileInfo(filePath, fileComment = "") {
+function createFileInfoObject(fileName, localHeaderOffset, fileComment = "") {
     let shouldCompress = true;
     const version = 45; // minimum for Zip64
 
-    const fileInfo = {
+    return {
         versionNeededToExtract: version, 
         generalPurposeBitFlag: Flags.Descriptor | Flags.UTF8,
         compressionMethod: shouldCompress ? CompressionMethods.deflate : CompressionMethods.store,
@@ -50,16 +52,14 @@ async function getFileInfo(filePath, fileComment = "") {
         crc32: 0xffffffff,
         compressedSize: 0,
         uncompressedSize: 0,
-        fileName: getFileName(filePath),
+        fileName,
         versionMadeby: version,
         fileComment,
         diskNumberStart: 0,
         internalFileAttributes: 0,
         externalFileAttributes: 0,
-        relativeOffsetOfLocalHeader: 0,
+        relativeOffsetOfLocalHeader: localHeaderOffset,
     };
-
-    return fileInfo;
 }
 
 /* 4.5.3 -Zip64 Extended Information Extra Field (0x0001):
@@ -344,81 +344,86 @@ function createZIP64DataDescriptor(fileInfo) {
     return descriptor;
 }
 
-async function writeFileLocalEntry(writeStream, filePath) {
-    const readStream = fs.createReadStream(filePath);
-    const fileInfo = await getFileInfo(filePath);
-    let bytesWritten = 0;
-
-    const localFileHeader = createFileHeader(fileInfo, false);
-    writeStream.write(localFileHeader);
-    bytesWritten += localFileHeader.length;
-    console.log("Wrote local file header for", fileInfo.fileName);
-
-    await pipeline(
-        readStream,
-        new Transform({     // Count uncompressed bytes and calculate crc32
-            transform(chunk, encoding, callback) {
-                fileInfo.uncompressedSize += chunk.length;
-                fileInfo.crc32 = updateCRC(chunk, fileInfo.crc32);
-                callback(null, chunk);
-            }
-        }),
-        createDeflateRaw(), // Compresses the stream
-        new Transform({     // Count compressed stream size and write to file
-            transform(chunk, encoding, callback) {
-                fileInfo.compressedSize += chunk.length;
-                bytesWritten += chunk.length; 
-                writeStream.write(chunk);
-                callback(null, chunk);
-            }
-        })
-    );
-    fileInfo.crc32 = (fileInfo.crc32 ^ 0xffffffff) >>> 0;
-
-    const dataDescriptor = createZIP64DataDescriptor(fileInfo);
-    writeStream.write(dataDescriptor);
-    bytesWritten += dataDescriptor.length;
-
-    return {fileInfo, bytesWritten};
+export function startZip(outputFilePath) {
+    return {
+        writeStream: createWriteStream(outputFilePath),
+        currentPosInWriteStream: 0,
+        fileInfoList: []
+    }
 }
 
-export async function createZip(filePathList, zipFilePath) {
-    const zipFD = await fsp.open(zipFilePath, "w");
-    const writeStream = zipFD.createWriteStream(zipFilePath);
-    const fileInfos = [];
-    let currentPosInWriteStream = 0;
+export async function addFileToZip(state, fileName, readStream) {
+    const deflate = createDeflateRaw();
+    const fileInfo = createFileInfoObject(fileName, state.currentPosInWriteStream);
+    state.fileInfoList.push(fileInfo);
 
-    for (const filePath of filePathList) {
-        const localHeaderOffset = currentPosInWriteStream;
-        const {fileInfo, bytesWritten} = await writeFileLocalEntry(writeStream, filePath);
-        fileInfo.relativeOffsetOfLocalHeader = localHeaderOffset;
-        fileInfos.push(fileInfo);
-        currentPosInWriteStream += bytesWritten;
-    }
+    const localFileHeader = createFileHeader(fileInfo, false);
+    state.writeStream.write(localFileHeader);
+    state.currentPosInWriteStream += localFileHeader.length;
+    console.log("Wrote local file header for", fileInfo.fileName);
 
-    const centralDirectoryStartPos = currentPosInWriteStream;
-    for (const fileInfo of fileInfos) {
+    const t1 = new Transform({
+        transform(chunk, encoding, callback) {
+            fileInfo.uncompressedSize += chunk.length;
+            fileInfo.crc32 = updateCRC(chunk, fileInfo.crc32)
+            callback(null, chunk);
+        }
+    });
+
+    const t2 = new Transform({
+        transform(chunk, encoding, callback) {
+            fileInfo.compressedSize += chunk.length;
+            state.currentPosInWriteStream += chunk.length;
+            callback(null, chunk);
+        }
+    });
+    
+    readStream.pipe(t1).pipe(deflate).pipe(t2).pipe(state.writeStream, {end: false});
+    await finished(t2);
+
+    fileInfo.crc32 = (fileInfo.crc32 ^ 0xffffffff) >>> 0;
+    console.log(`Wrote file data. C: ${fileInfo.compressedSize} U: ${fileInfo.uncompressedSize}`);
+
+    const dataDescriptor = createZIP64DataDescriptor(fileInfo);
+    state.writeStream.write(dataDescriptor);
+    state.currentPosInWriteStream += dataDescriptor.length;
+    console.log(`Wrote data descriptor`);
+}
+
+export async function endZip(state) {
+    const centralDirectoryStartPos = state.currentPosInWriteStream;
+    for (const fileInfo of state.fileInfoList) {
         const centralDirectoryRecord = createFileHeader(fileInfo, true);
-        writeStream.write(centralDirectoryRecord);
-        currentPosInWriteStream += centralDirectoryRecord.length;
+        state.writeStream.write(centralDirectoryRecord);
+        state.currentPosInWriteStream += centralDirectoryRecord.length;
         console.log("Wrote central directory file header for", fileInfo.fileName.toString(), centralDirectoryRecord.length, "bytes");
     }
+    const centralDirectorySize = state.currentPosInWriteStream - centralDirectoryStartPos;
 
-    const centralDirectorySize = currentPosInWriteStream - centralDirectoryStartPos;
-    const zip64EndRecord = createZIP64EndOfCentralDirectoryRecord(centralDirectoryStartPos, centralDirectorySize, fileInfos.length);
-    const endRecordOffset = currentPosInWriteStream;
-    currentPosInWriteStream += writeStream.write(zip64EndRecord);
+    const zip64EndRecord = createZIP64EndOfCentralDirectoryRecord(centralDirectoryStartPos, centralDirectorySize, state.fileInfoList.length);
+    const endRecordOffset = state.currentPosInWriteStream;
+    state.currentPosInWriteStream += state.writeStream.write(zip64EndRecord);
     console.log("Wrote zip64 end of central directory header");
 
     const zip64EndLocator = createZIP64EndOfCentralDirectoryLocator(endRecordOffset);
-    currentPosInWriteStream += writeStream.write(zip64EndLocator);
+    state.currentPosInWriteStream += state.writeStream.write(zip64EndLocator);
     console.log("Wrote zip64 end of central directory locator");
 
-    const endRecord = createEndOfCentralDirectoryRecord(centralDirectoryStartPos, centralDirectorySize, fileInfos.length);
-    currentPosInWriteStream += writeStream.write(endRecord);
+    const endRecord = createEndOfCentralDirectoryRecord(centralDirectoryStartPos, centralDirectorySize, state.fileInfoList.length);
+    state.currentPosInWriteStream += state.writeStream.write(endRecord);
     console.log("Wrote end of central directory record");
-
-    writeStream.close();
 }
 
-createZip(["./compressable.txt", "./test1.txt", "./test2.txt"], "./nick.zip");
+export async function createZipFromFileList(filePathList, zipFilePath) {
+    const zipState = startZip(zipFilePath);
+
+    for (const filePath of filePathList) {
+        const readStream = fs.createReadStream(filePath);
+        const fileName = await getFileNameFromPath(filePath);
+        await addFileToZip(zipState, fileName, readStream);
+    }
+
+    await endZip(zipState);
+}
+
+//createZipFromFileList(["big.file", "./compressable.txt", "./test1.txt", "./test2.txt", "./유니코드 테스트.txt"], "./nick.zip");
