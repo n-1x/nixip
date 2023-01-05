@@ -21,8 +21,9 @@ import fs from "fs";
 import { Transform } from "stream";
 import { finished } from "stream/promises";
 import { createDeflateRaw } from "zlib";
-import { Signatures, CompressionMethods, Flags } from "./constants.mjs";
+import { Signatures, CompressionMethods, Flags, Structs } from "./constants.mjs";
 import { updateCRC } from "./crc.mjs";
+import { createBufferForStruct } from "./serialise.mjs";
 
 export function getFileNameFromPath(filePath) {
     let fileName = "";
@@ -251,26 +252,14 @@ function createFileHeader(originalFileInfo, isCentralDirectory = false) {
  */
 function createZIP64EndOfCentralDirectoryRecord(centralDirectoryStart, centralDirectorySize, numEntries) {
     const sizeOfFixedFields = 56;
-    const sizeOfVariableData = 0;
-    const sizeOfCentralDirectoryRecord = sizeOfFixedFields + sizeOfVariableData - 12;
+    const sizeOfCentralDirectoryRecord = sizeOfFixedFields - 12; // currently no variable data here
 
-    const record = Buffer.alloc(sizeOfFixedFields + sizeOfVariableData);
-    const diskNumber = 0;
-    const diskNumberWithinCentralDirectory = 0;
-    const versionMadeBy = 45;
-    const versionNeededToExtract = 45;
-
-    let bytesWritten = 0;
-    bytesWritten = record.writeUInt32LE(Signatures.zip64EndOfCentralDirectory, bytesWritten);
-    bytesWritten = record.writeBigUInt64LE(BigInt(sizeOfCentralDirectoryRecord), bytesWritten);
-    bytesWritten = record.writeUInt16LE(versionMadeBy, bytesWritten);
-    bytesWritten = record.writeUInt16LE(versionNeededToExtract, bytesWritten);
-    bytesWritten = record.writeUInt32LE(diskNumber, bytesWritten);
-    bytesWritten = record.writeUInt32LE(diskNumberWithinCentralDirectory, bytesWritten);
-    bytesWritten = record.writeBigUInt64LE(BigInt(numEntries), bytesWritten);
-    bytesWritten = record.writeBigUInt64LE(BigInt(numEntries), bytesWritten);
-    bytesWritten = record.writeBigUInt64LE(BigInt(centralDirectorySize), bytesWritten);
-    bytesWritten = record.writeBigUInt64LE(BigInt(centralDirectoryStart), bytesWritten);
+    const [record] = createBufferForStruct(Structs.zip64EndOfCentralDirectoryRecord, {
+        sizeOfCentralDirectoryRecord: BigInt(sizeOfCentralDirectoryRecord),
+        numEntries: BigInt(numEntries),
+        centralDirectorySize: BigInt(centralDirectorySize),
+        centralDirectoryStart: BigInt(centralDirectoryStart)
+    });
 
     return record;
 }
@@ -292,10 +281,6 @@ function createZIP64EndOfCentralDirectoryRecord(centralDirectoryStart, centralDi
       .ZIP file comment       (variable size)
  */
 function createEndOfCentralDirectoryRecord(centralDirectoryStart, centralDirectorySize, numEntries, zipFileComment = "") {
-    const centralDirectoryRecord = Buffer.alloc(22 + zipFileComment.length);
-    const diskNumber = 0;
-    const diskNumberWithinCentralDirectory = 0;
-
     if (numEntries >= 0xffff) {
         numEntries = 0xffff;
     }
@@ -308,40 +293,33 @@ function createEndOfCentralDirectoryRecord(centralDirectoryStart, centralDirecto
         centralDirectoryStart = 0xffffffff;
     }
 
-    let bytesWritten = 0;
-    bytesWritten = centralDirectoryRecord.writeUInt32LE(Signatures.endOfCentralDirectory, bytesWritten);
-    bytesWritten = centralDirectoryRecord.writeUInt16LE(diskNumber, bytesWritten);
-    bytesWritten = centralDirectoryRecord.writeUInt16LE(diskNumberWithinCentralDirectory, bytesWritten);
-    bytesWritten = centralDirectoryRecord.writeUInt16LE(numEntries, bytesWritten);
-    bytesWritten = centralDirectoryRecord.writeUInt16LE(numEntries, bytesWritten);
-    bytesWritten = centralDirectoryRecord.writeUInt32LE(centralDirectorySize, bytesWritten);
-    bytesWritten = centralDirectoryRecord.writeUInt32LE(centralDirectoryStart, bytesWritten);
-    bytesWritten = centralDirectoryRecord.writeUInt16LE(zipFileComment.length, bytesWritten);
-    bytesWritten += centralDirectoryRecord.write(zipFileComment, bytesWritten);
+    const [record, bytesWritten] = createBufferForStruct(Structs.endOfCentralDirectoryRecord, {
+        numEntries,
+        centralDirectorySize,
+        centralDirectoryStart,
+        zipFileCommentLength: zipFileComment.length
+    });
+    record.write(zipFileComment, bytesWritten);
 
-    return centralDirectoryRecord;
+    return record;
 }
 
 function createZIP64EndOfCentralDirectoryLocator(relativeOffset) {
-    const locator = Buffer.alloc(20);
+    const [record] = createBufferForStruct(Structs.zip64EndOfCentralDirectoryLocator, {
+        relativeOffset: BigInt(relativeOffset)
+    });
     
-    let bytesWritten = locator.writeUInt32LE(Signatures.zip64EndOfCentralDirectoryLocator);
-    bytesWritten = locator.writeUInt32LE(0, bytesWritten); // number of disk containing start of central directory
-    bytesWritten = locator.writeBigUint64LE(BigInt(relativeOffset), bytesWritten);
-    bytesWritten = locator.writeUInt32LE(1, bytesWritten); // total number of disks
-    
-    return locator;
+    return record;
 }
 
 function createZIP64DataDescriptor(fileInfo) {
-    const descriptor = Buffer.alloc(24);
+    const [record] = createBufferForStruct(Structs.zip64DataDescriptor, {
+        ...fileInfo,
+        compressedSize: BigInt(fileInfo.compressedSize),
+        uncompressedSize: BigInt(fileInfo.uncompressedSize)
+    });
     
-    let bytesWritten = descriptor.writeUint32LE(Signatures.dataDescriptor);
-    bytesWritten = descriptor.writeUint32LE(fileInfo.crc32, bytesWritten);
-    bytesWritten = descriptor.writeBigUint64LE(BigInt(fileInfo.compressedSize), bytesWritten);
-    bytesWritten = descriptor.writeBigUint64LE(BigInt(fileInfo.uncompressedSize), bytesWritten);
-    
-    return descriptor;
+    return record;
 }
 
 export function startZip(outputFilePath) {
@@ -426,4 +404,4 @@ export async function createZipFromFileList(filePathList, zipFilePath) {
     await endZip(zipState);
 }
 
-//createZipFromFileList(["big.file", "./compressable.txt", "./test1.txt", "./test2.txt", "./유니코드 테스트.txt"], "./nick.zip");
+createZipFromFileList(["./compressable.txt", "./test1.txt", "./test2.txt", "./유니코드 테스트.txt"], "./nick.zip");
