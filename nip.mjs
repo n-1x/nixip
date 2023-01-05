@@ -346,7 +346,7 @@ function createZIP64DataDescriptor(fileInfo) {
 
 export function startZip(outputFilePath) {
     return {
-        writeStream: createWriteStream(outputFilePath),
+        writeStream: fs.createWriteStream(outputFilePath),
         currentPosInWriteStream: 0,
         fileInfoList: []
     }
