@@ -21,9 +21,9 @@ import fs from "fs";
 import { Transform } from "stream";
 import { finished } from "stream/promises";
 import { createDeflateRaw } from "zlib";
-import { Signatures, CompressionMethods, Flags, Structs } from "./constants.mjs";
+import { CompressionMethods, Flags, Definitions } from "./constants.mjs";
 import { updateCRC } from "./crc.mjs";
-import { createBufferForStruct } from "./serialise.mjs";
+import { Struct, Types } from "./serialise.mjs";
 
 export function getFileNameFromPath(filePath) {
     let fileName = "";
@@ -42,23 +42,20 @@ export function getFileNameFromPath(filePath) {
 
 function createFileInfoObject(fileName, localHeaderOffset, fileComment = "") {
     let shouldCompress = true;
-    const version = 45; // minimum for Zip64
+    const fileNameBuffer = Buffer.from(fileName);
+    const fileCommentBuffer = Buffer.from(fileComment);
 
     return {
-        versionNeededToExtract: version, 
-        generalPurposeBitFlag: Flags.Descriptor | Flags.UTF8,
+        fileNameBuffer,
+        fileNameLength: fileNameBuffer.length,
+        fileCommentBuffer,
+        fileCommentLength: fileCommentBuffer.length,
         compressionMethod: shouldCompress ? CompressionMethods.deflate : CompressionMethods.store,
-        lastModFileTime: 0,
-        lastModFileDate: 0,
         crc32: 0xffffffff,
         compressedSize: 0,
         uncompressedSize: 0,
         fileName,
-        versionMadeby: version,
         fileComment,
-        diskNumberStart: 0,
-        internalFileAttributes: 0,
-        externalFileAttributes: 0,
         relativeOffsetOfLocalHeader: localHeaderOffset,
     };
 }
@@ -96,138 +93,80 @@ function createFileInfoObject(fileName, localHeaderOffset, fileComment = "") {
       flag is set indicating masking, the value stored in the
       Local Header for the original file size will be zero.
 */
-function createZIP64ExtraField(zip64Fields, isCentralDirectory) {
-    // Only works because all optional fields are currently 8 bytes
-    const optionalFieldsLength = Object.keys(zip64Fields).length * 8;
-    const zip64Header = Buffer.alloc(4 + optionalFieldsLength);
-
-    let bytesWritten = 0;
-    bytesWritten = zip64Header.writeUInt16LE(0x0001, bytesWritten);
-    bytesWritten = zip64Header.writeUInt16LE(optionalFieldsLength, bytesWritten);
+function createZIP64ExtraField(zip64Fields) {
+    const s = new Struct(Definitions.zip64ExtendedInformationExtraField);
+    s.addEntry("optionalFieldsLength", Types.u16, 0);
 
     if (zip64Fields.uncompressedSize !== undefined) {
-        const val = BigInt(isCentralDirectory ? zip64Fields.uncompressedSize : 0);
-        bytesWritten = zip64Header.writeBigUInt64LE(val, bytesWritten);
+        s.addEntry("uncompressedSize", Types.u64, zip64Fields.uncompressedSize);
     }
 
     if (zip64Fields.compressedSize !== undefined) {
-        const val = BigInt(isCentralDirectory ? zip64Fields.compressedSize : 0);
-        bytesWritten = zip64Header.writeBigUInt64LE(val, bytesWritten);
+        s.addEntry("compressedSize", Types.u64, zip64Fields.compressedSize);
     }
 
     if (zip64Fields.relativeOffsetOfLocalHeader !== undefined) {
-        bytesWritten = zip64Header.writeBigUInt64LE(BigInt(zip64Fields.relativeOffsetOfLocalHeader), bytesWritten);
+        s.addEntry("relativeOffsetOfLocalHeader", Types.u64, zip64Fields.relativeOffsetOfLocalHeader);
     }
 
-    return zip64Header;
+    s.editEntry("optionalFieldsLength", s.sizeFrom("optionalFieldsLength"));
+
+    return s.createBuffer();
 }
 
-/* Structure of file header (* only present in central directory header):
-        signature                       4 bytes 
-        version made by                 2 bytes *
-        version needed to extract       2 bytes
-        general purpose bit flag        2 bytes
-        compression method              2 bytes
-        last mod file time              2 bytes
-        last mod file date              2 bytes
-        crc-32                          4 bytes
-        compressed size                 4 bytes
-        uncompressed size               4 bytes
-        file name length                2 bytes
-        extra field length              2 bytes
-        file comment length             2 bytes *
-        disk number start               2 bytes *
-        internal file attributes        2 bytes *
-        external file attributes        4 bytes *
-        relative offset of local header 4 bytes *
+function createLocalFileHeader(originalFileInfo) {
+    const fileInfo = { ...originalFileInfo };
+    const struct = new Struct(Definitions.localFileHeader, fileInfo);
+    const buf = struct.createBuffer(fileInfo.fileNameLength);
 
-        file name (variable size)
-        extra field (variable size)
-        file comment (variable size)            *
- */
-function createFileHeader(originalFileInfo, isCentralDirectory = false) {
+    let bytePos = buf.bytesSerialised;
+    bytePos += fileInfo.fileNameBuffer.copy(buf, bytePos);
+    return buf;
+}
+
+function createCentralDirectoryRecord(originalFileInfo) {
     const fileInfo = { ...originalFileInfo, extraFieldLength: 0 };
-    const fileNameBuffer = Buffer.from(fileInfo.fileName);
-    let headerSize = (isCentralDirectory ? 46 : 30) + fileNameBuffer.length;
-    let zip64Header = null;
     const zip64Fields = {};
 
-    if (isCentralDirectory) {
-        if (fileInfo.uncompressedSize >= 0xffffffff || fileInfo.compressedSize >= 0xffffffff) {
-            zip64Fields.compressedSize = fileInfo.compressedSize,
+    if (fileInfo.uncompressedSize >= 0xffffffff
+        || fileInfo.compressedSize >= 0xffffffff) {
+        zip64Fields.compressedSize = fileInfo.compressedSize,
             zip64Fields.uncompressedSize = fileInfo.uncompressedSize
-            fileInfo.uncompressedSize = 0xffffffff;
-            fileInfo.compressedSize = 0xffffffff;
-        }
-
-        if (fileInfo.relativeOffsetOfLocalHeader > 0xffffffff) {
-            zip64Fields.relativeOffsetOfLocalHeader = fileInfo.relativeOffsetOfLocalHeader;
-            fileInfo.relativeOffsetOfLocalHeader = 0xffffffff;
-        }
-
-        console.log("Moving these fields to ZIP64 extra field: ", Object.keys(zip64Fields));
+        fileInfo.uncompressedSize = 0xffffffff;
+        fileInfo.compressedSize = 0xffffffff;
     }
 
+    if (fileInfo.relativeOffsetOfLocalHeader > 0xffffffff) {
+        zip64Fields.relativeOffsetOfLocalHeader = fileInfo.relativeOffsetOfLocalHeader;
+        fileInfo.relativeOffsetOfLocalHeader = 0xffffffff;
+    }
+
+    console.log("Moving these fields to ZIP64 extra field: ", Object.keys(zip64Fields));
+
+    let zip64Header = null;
     if (Object.keys(zip64Fields).length > 0) {
-        zip64Header = createZIP64ExtraField(zip64Fields, isCentralDirectory);
+        zip64Header = createZIP64ExtraField(zip64Fields);
         fileInfo.extraFieldLength = zip64Header.length;
-        headerSize += fileInfo.extraFieldLength;
     }
+    const struct = new Struct(Definitions.centralDirectoryRecord, fileInfo);
 
-    let fileCommentBuffer = null;
-    let fileCommentLength = 0;
-    if (isCentralDirectory) {
-        fileCommentBuffer = Buffer.from(fileInfo.fileComment); //TODO: Just create the buffer at info time
-        fileCommentLength = fileCommentBuffer.length;
-        headerSize += fileCommentLength;
-    }
-
-    const header = Buffer.alloc(headerSize);
-    let bytesWritten = 0;
-
-    const signature = isCentralDirectory ? Signatures.centralDirectoryHeader : Signatures.localFileHeader;
-    bytesWritten = header.writeUInt32LE(signature, bytesWritten);
-
-    if (isCentralDirectory) {
-        bytesWritten = header.writeUInt16LE(fileInfo.versionMadeby, bytesWritten);
-    }
-
-    bytesWritten = header.writeUInt16LE(fileInfo.versionNeededToExtract, bytesWritten);
-    bytesWritten = header.writeUInt16LE(fileInfo.generalPurposeBitFlag, bytesWritten);
-    bytesWritten = header.writeUInt16LE(fileInfo.compressionMethod, bytesWritten);
-    bytesWritten = header.writeUInt16LE(fileInfo.lastModFileTime, bytesWritten);
-    bytesWritten = header.writeUInt16LE(fileInfo.lastModFileDate, bytesWritten);
-
-    // for the following 3 fields, if they are local records, the value is not yet known
-    // and will be calculated while writing the file data and placed in a descriptor
-    // but for central directory records, they are known and should be includd
-    bytesWritten = header.writeUInt32LE(isCentralDirectory ? fileInfo.crc32 : 0, bytesWritten);
-    bytesWritten = header.writeUInt32LE(isCentralDirectory ? fileInfo.compressedSize : 0, bytesWritten);
-    bytesWritten = header.writeUInt32LE(isCentralDirectory ? fileInfo.uncompressedSize : 0, bytesWritten);
-    bytesWritten = header.writeUInt16LE(fileNameBuffer.length, bytesWritten);
-    bytesWritten = header.writeUInt16LE(fileInfo.extraFieldLength, bytesWritten);
-
-    if (isCentralDirectory) {
-        bytesWritten = header.writeUInt16LE(fileCommentLength, bytesWritten);
-        bytesWritten = header.writeUint16LE(0, bytesWritten); // disk number start
-        bytesWritten = header.writeUInt16LE(fileInfo.internalFileAttributes, bytesWritten);
-        bytesWritten = header.writeUInt32LE(fileInfo.externalFileAttributes, bytesWritten);
-        bytesWritten = header.writeUInt32LE(fileInfo.relativeOffsetOfLocalHeader, bytesWritten);
-    }
-
-    bytesWritten += fileNameBuffer.copy(header, bytesWritten);
+    const extraSpace = fileInfo.fileNameLength
+        + fileInfo.fileCommentLength + fileInfo.extraFieldLength;
+    const buf = struct.createBuffer(extraSpace);
+    let bytePos = buf.bytesSerialised;
+    bytePos += fileInfo.fileNameBuffer.copy(buf, bytePos);
 
     if (fileInfo.extraFieldLength > 0) {
-        bytesWritten += zip64Header.copy(header, bytesWritten);
+        bytePos += zip64Header.copy(buf, bytePos);
         console.log("Wrote", zip64Header.length, "byte extra field");
     }
 
-    if (isCentralDirectory && fileCommentLength > 0) {
+    if (fileInfo.fileCommentLength > 0) {
         console.log("Writing file comment, length", fileCommentLength)
-        bytesWritten += fileCommentBuffer.copy(header, bytesWritten);
+        bytePos += fileCommentBuffer.copy(buf, bytePos);
     }
 
-    return header;
+    return buf;
 }
 
 /* 4.3.14  Zip64 end of central directory record
@@ -251,17 +190,18 @@ function createFileHeader(originalFileInfo, isCentralDirectory = false) {
         zip64 extensible data sector    (variable size)
  */
 function createZIP64EndOfCentralDirectoryRecord(centralDirectoryStart, centralDirectorySize, numEntries) {
-    const sizeOfFixedFields = 56;
-    const sizeOfCentralDirectoryRecord = sizeOfFixedFields - 12; // currently no variable data here
+    const struct = new Struct(
+        Definitions.zip64EndOfCentralDirectoryRecord,
+        {
+            numEntries,
+            numEntriesThisDisk: numEntries,
+            centralDirectorySize,
+            centralDirectoryStart
+        }
+    );
+    struct.sizeOfCentralDirectoryRecord = struct.sizeFrom("sizeOfCentralDirectoryRecord");
 
-    const [record] = createBufferForStruct(Structs.zip64EndOfCentralDirectoryRecord, {
-        sizeOfCentralDirectoryRecord: BigInt(sizeOfCentralDirectoryRecord),
-        numEntries: BigInt(numEntries),
-        centralDirectorySize: BigInt(centralDirectorySize),
-        centralDirectoryStart: BigInt(centralDirectoryStart)
-    });
-
-    return record;
+    return struct.createBuffer();
 }
 
 /* 4.3.16  End of central directory record:
@@ -293,33 +233,45 @@ function createEndOfCentralDirectoryRecord(centralDirectoryStart, centralDirecto
         centralDirectoryStart = 0xffffffff;
     }
 
-    const [record, bytesWritten] = createBufferForStruct(Structs.endOfCentralDirectoryRecord, {
-        numEntries,
-        centralDirectorySize,
-        centralDirectoryStart,
-        zipFileCommentLength: zipFileComment.length
-    });
-    record.write(zipFileComment, bytesWritten);
+    const struct = new Struct(
+        Definitions.endOfCentralDirectoryRecord,
+        {
+            numEntries,
+            numEntriesThisDisk: numEntries,
+            centralDirectorySize,
+            centralDirectoryStart,
+            zipFileCommentLength: zipFileComment.length
+        }
+    );
+
+    const record = struct.createBuffer(zipFileComment.length);
+    record.write(zipFileComment, record.bytesSerialised);
 
     return record;
 }
 
 function createZIP64EndOfCentralDirectoryLocator(relativeOffset) {
-    const [record] = createBufferForStruct(Structs.zip64EndOfCentralDirectoryLocator, {
-        relativeOffset: BigInt(relativeOffset)
-    });
-    
-    return record;
+    const struct = new Struct(
+        Definitions.zip64EndOfCentralDirectoryLocator,
+        {
+            relativeOffset
+        }
+    );
+
+    return struct.createBuffer();
 }
 
 function createZIP64DataDescriptor(fileInfo) {
-    const [record] = createBufferForStruct(Structs.zip64DataDescriptor, {
-        ...fileInfo,
-        compressedSize: BigInt(fileInfo.compressedSize),
-        uncompressedSize: BigInt(fileInfo.uncompressedSize)
-    });
-    
-    return record;
+    const struct = new Struct(
+        Definitions.zip64DataDescriptor,
+        {
+            ...fileInfo,
+            compressedSize: BigInt(fileInfo.compressedSize),
+            uncompressedSize: BigInt(fileInfo.uncompressedSize)
+        }
+    )
+
+    return struct.createBuffer();
 }
 
 export function startZip(outputFilePath) {
@@ -335,7 +287,7 @@ export async function addFileToZip(state, fileName, readStream) {
     const fileInfo = createFileInfoObject(fileName, state.currentPosInWriteStream);
     state.fileInfoList.push(fileInfo);
 
-    const localFileHeader = createFileHeader(fileInfo, false);
+    const localFileHeader = createLocalFileHeader(fileInfo);
     state.writeStream.write(localFileHeader);
     state.currentPosInWriteStream += localFileHeader.length;
     console.log("Wrote local file header for", fileInfo.fileName);
@@ -355,8 +307,8 @@ export async function addFileToZip(state, fileName, readStream) {
             callback(null, chunk);
         }
     });
-    
-    readStream.pipe(t1).pipe(deflate).pipe(t2).pipe(state.writeStream, {end: false});
+
+    readStream.pipe(t1).pipe(deflate).pipe(t2).pipe(state.writeStream, { end: false });
     await finished(t2);
 
     fileInfo.crc32 = (fileInfo.crc32 ^ 0xffffffff) >>> 0;
@@ -371,7 +323,7 @@ export async function addFileToZip(state, fileName, readStream) {
 export async function endZip(state) {
     const centralDirectoryStartPos = state.currentPosInWriteStream;
     for (const fileInfo of state.fileInfoList) {
-        const centralDirectoryRecord = createFileHeader(fileInfo, true);
+        const centralDirectoryRecord = createCentralDirectoryRecord(fileInfo);
         state.writeStream.write(centralDirectoryRecord);
         state.currentPosInWriteStream += centralDirectoryRecord.length;
         console.log("Wrote central directory file header for", fileInfo.fileName.toString(), centralDirectoryRecord.length, "bytes");

@@ -1,7 +1,7 @@
-import { prepareStructs, Types } from "./serialise.mjs";
+import { Types } from "./serialise.mjs";
 
 export const Signatures = {
-    centralDirectoryHeader: 0x02014b50,
+    centralDirectoryRecord: 0x02014b50,
     localFileHeader: 0x04034b50,
     endOfCentralDirectory: 0x06054b50,
     zip64EndOfCentralDirectory: 0x06064b50,
@@ -20,7 +20,42 @@ export const Flags = {
 };
 
 const {u16, u32, u64} = Types;
-export const Structs = prepareStructs({
+export const Definitions = {
+    localFileHeader: [
+        ["signature", u32, Signatures.localFileHeader],
+        ["versionNeededToExtract", u16, 45],
+        ["bitFlags", u16, Flags.Descriptor | Flags.UTF8],
+        ["compressionMethod", u16],
+        ["lastModFileTime", u16, 0],
+        ["lastModFileDate", u16, 0],
+        ["crc32", u32, 0],
+        ["compressedSize", u32, 0],
+        ["uncompressedSize", u32, 0],
+        ["fileNameLength", u16],
+        ["extraFieldLength", u16, 0],
+    ],
+    centralDirectoryRecord: [
+        ["signature", u32, Signatures.centralDirectoryRecord],
+        ["versionMadeBy", u16, 45],
+        ["versionNeededToExtract", u16, 45],
+        ["bitFlags", u16, Flags.Descriptor | Flags.UTF8],
+        ["compressionMethod", u16],
+        ["lastModFileTime", u16, 0],
+        ["lastModFileDate", u16, 0],
+        ["crc32", u32],
+        ["compressedSize", u32],
+        ["uncompressedSize", u32],
+        ["fileNameLength", u16],
+        ["extraFieldLength", u16],
+        ["fileCommentLength", u16],
+        ["diskNumberStart", u16, 0],
+        ["internalFileAttributes", u16, 0],
+        ["externalFileAttributes", u32, 0],
+        ["relativeOffsetOfLocalHeader", u32]
+    ],
+    zip64ExtendedInformationExtraField: [
+        ["tag", u16, 0x0001],
+    ],
     zip64EndOfCentralDirectoryRecord: [
         ["signature", u32, Signatures.zip64EndOfCentralDirectory],
         ["sizeOfCentralDirectoryRecord", u64],
@@ -28,7 +63,7 @@ export const Structs = prepareStructs({
         ["versionNeededToExtract", u16, 45],
         ["diskNumber", u32, 0],
         ["diskNumberWithinCentralDirectory", u32, 0],
-        ["numEntries", u64],
+        ["numEntriesThisDisk", u64],
         ["numEntries", u64],
         ["centralDirectorySize", u64],
         ["centralDirectoryStart", u64]
@@ -37,7 +72,7 @@ export const Structs = prepareStructs({
         ["signature", u32, Signatures.endOfCentralDirectory],
         ["diskNumber", u16, 0],
         ["diskNumberWithinCentralDirectory", u16, 0],
-        ["numEntries", u16],
+        ["numEntriesThisDisk", u16],
         ["numEntries", u16],
         ["centralDirectorySize", u32],
         ["centralDirectoryStart", u32],
@@ -55,4 +90,4 @@ export const Structs = prepareStructs({
         ["compressedSize", u64],
         ["uncompressedSize", u64]
     ],
-});
+};
